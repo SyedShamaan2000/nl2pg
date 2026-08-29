@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  postgres_db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nl2pg_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: syed
+      POSTGRES_PASSWORD: syed123
+      POSTGRES_DB: nl2pg
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - lp_net
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: syed_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: syed@syed.com
+      PGADMIN_DEFAULT_PASSWORD: syed123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres_db
+    networks:
+      - nl2pg_net
+
+volumes:
+  pgdata:
+
+# Define the network
+networks:
+  lp_net:
+    name: shared_nl2pg_net
+    external: true
