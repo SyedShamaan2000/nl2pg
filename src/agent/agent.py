@@ -1,14 +1,13 @@
-"""Schema-aware, validated NL-to-SQL agent.
+"""Schema-aware, validated NL-to-SQL agent (v2).
 
-This is the real solution (Agent v1), as opposed to the naive baseline.
-Key differences from baseline:
-  - Receives introspected schema as context before generating a query.
-  - Output is validated against a Pydantic ProposedAction schema.
-  - Table/column names are checked against the live schema before execution.
-  - All write actions (insert/update/delete) require human approval (see approval.py).
-  - DEBUG-level logs at every decision point.
-
-Ground Rule #4 is non-negotiable: no write action auto-executes.
+Iteration 2 changes vs v1:
+  - Aggregation support: 'group_by' and 'having' fields on ProposedAction
+    (Fixes: "customers with more than 10 orders" — no more naive SELECT *).
+  - 'clarify' action: agent can ask for clarification instead of guessing.
+  - System prompt now tells the LLM that Postgres supports GROUP BY, HAVING,
+    JOIN, subqueries — explicitly with examples.
+  - Semantic validation: catches obviously wrong queries (ambiguous table
+    selection, etc.) before execution.
 """
 
 import logging
@@ -37,33 +36,66 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _quote_literal(val: Any) -> str:
+    """Format a Python value as a SQL literal."""
+    if val is None:
+        return "NULL"
+    if isinstance(val, bool):
+        return "TRUE" if val else "FALSE"
+    if isinstance(val, (int, float)):
+        return str(val)
+    return repr(str(val))
+
+
+def _render_filter(f: Filter) -> str:
+    """Render a Filter into a SQL WHERE / HAVING expression."""
+    val = f.value
+    if f.operator == "IN":
+        if isinstance(val, (list, tuple)):
+            items = ", ".join(_quote_literal(v) for v in val)
+        else:
+            items = _quote_literal(val)
+        return f"{f.column} IN ({items})"
+    if f.operator == "LIKE":
+        return f"{f.column} LIKE {_quote_literal(val)}"
+    return f"{f.column} {f.operator} {_quote_literal(val)}"
+
+
 def build_sql(action: ProposedAction) -> str:
+    """Build SQL from a ProposedAction. Supports aggregation via group_by / having.
+
+    SELECT with group_by: SELECT <group_by cols> FROM <table> [WHERE ...]
+                          GROUP BY <cols> [HAVING ...]
+    SELECT without group_by: SELECT * FROM <table> [WHERE ...]
+    UPDATE / DELETE take the WHERE clause from filters only.
+    """
     table = action.table
     filters = action.filters
-
-    def _condition(f: Filter) -> str:
-        val = f.value
-        if f.operator == "IN":
-            if isinstance(val, (list, tuple)):
-                items = ", ".join(repr(v) for v in val)
-            else:
-                items = repr(val)
-            return f"{f.column} IN ({items})"
-        if f.operator == "LIKE":
-            return f"{f.column} LIKE {repr(val)}"
-        return f"{f.column} {f.operator} {repr(val)}"
+    group_by = action.group_by
+    having = action.having
 
     where = ""
     if filters:
-        clauses = " AND ".join(_condition(f) for f in filters)
+        clauses = " AND ".join(_render_filter(f) for f in filters)
         where = f" WHERE {clauses}"
 
     if action.action == "select":
+        if group_by:
+            group_clause = ", ".join(group_by)
+            having_clause = ""
+            if having:
+                having_clause = (
+                    " HAVING " + " AND ".join(_render_filter(f) for f in having)
+                )
+            return (
+                f"SELECT {group_clause} FROM {table}{where} "
+                f"GROUP BY {group_clause}{having_clause};"
+            )
         return f"SELECT * FROM {table}{where};"
     if action.action == "update":
         if not action.values:
             raise ValueError("UPDATE action requires non-None values")
-        pairs = ", ".join(f"{k} = {repr(v)}" for k, v in action.values.items())
+        pairs = ", ".join(f"{k} = {_quote_literal(v)}" for k, v in action.values.items())
         return f"UPDATE {table} SET {pairs}{where};"
     if action.action == "delete":
         return f"DELETE FROM {table}{where};"
@@ -72,7 +104,7 @@ def build_sql(action: ProposedAction) -> str:
 
 def _build_insert_sql(table: str, values: dict[str, Any]) -> str:
     cols = ", ".join(values.keys())
-    vals = ", ".join(repr(v) for v in values.values())
+    vals = ", ".join(_quote_literal(v) for v in values.values())
     return f"INSERT INTO {table} ({cols}) VALUES ({vals});"
 
 
@@ -83,6 +115,34 @@ def _build_insert_sql(table: str, values: dict[str, Any]) -> str:
 
 class SchemaValidationError(Exception):
     pass
+
+
+# Phrases that strongly imply aggregation, used by semantic sanity check.
+_AGGREGATION_HINTS = (
+    "more than",
+    "less than",
+    "at least",
+    "at most",
+    "greater than",
+    "fewer than",
+    "count of",
+    "number of",
+    "sum of",
+    "total of",
+    "average",
+    "per customer",
+    "per user",
+    "by customer",
+    "by user",
+    "group by",
+    "having",
+)
+
+
+def _looks_like_aggregation_request(request: str) -> bool:
+    """Heuristic: does the NL request seem to need GROUP BY / aggregation?"""
+    r = request.lower()
+    return any(hint in r for hint in _AGGREGATION_HINTS)
 
 
 class Agent:
@@ -102,7 +162,8 @@ class Agent:
         tables = self._get_schema()
         schema_text = schema_to_text(tables)
         logger.debug(
-            f"Schema context sent to agent ({len(schema_text)} chars):\n{schema_text[:500]}..."
+            f"Schema context sent to agent ({len(schema_text)} chars):\n"
+            f"{schema_text[:500]}..."
         )
 
         raw_action, parse_error = self._generate_action(request, schema_text)
@@ -116,14 +177,26 @@ class Agent:
 
         logger.debug(f"Agent parsed ProposedAction: {raw_action!r}")
 
-        validation_error = self._validate_action(raw_action, tables)
-        if validation_error:
-            logger.warning(f"Schema validation failed: {validation_error}")
+        # Clarification short-circuit: agent said it needs more info.
+        if raw_action.action == "clarify":
+            logger.info("Agent requested clarification (no query executed).")
             return self._result(
                 raw_action=raw_action.model_dump(),
                 sql=None, executed=False,
                 approval_required=False, approved=None,
-                rows=None, error=f"Schema validation error: {validation_error}",
+                rows=None,
+                error=None,
+                clarification=raw_action.reasoning,
+            )
+
+        validation_error = self._validate_action(raw_action, tables, request)
+        if validation_error:
+            logger.warning(f"Schema/semantic validation failed: {validation_error}")
+            return self._result(
+                raw_action=raw_action.model_dump(),
+                sql=None, executed=False,
+                approval_required=False, approved=None,
+                rows=None, error=f"Validation error: {validation_error}",
             )
 
         is_write = raw_action.action in ("insert", "update", "delete")
@@ -176,13 +249,30 @@ class Agent:
             return None, "Empty natural-language request."
 
         system_prompt = (
-            "You are a database query planner. Respond ONLY with valid JSON.\n"
-            "Shape: {\"action\":\"select\"|\"insert\"|\"update\"|\"delete\","
-            "\"table\":\"...\",\"filters\":[{\"column\":\"...\",\"operator\":\"=\",\"value\":\"...\"}],"
-            "\"values\":{...},\"reasoning\":\"...\"}\n"
-            f"Schema:\n{schema_text}\n"
-            "Rules: action in list; filter operators =,!=,>,<,>=,<=,IN,LIKE; "
-            "UPDATE/DELETE require >=1 filter; INSERT requires values; SELECT uses WHERE filters."
+            "You are a Postgres query planner. Output ONLY JSON matching the "
+            "ProposedAction schema. "
+            "Postgres supports GROUP BY, HAVING, JOIN, and subqueries — use them "
+            "when the request asks for counts, totals, or comparisons across "
+            "groups (e.g. 'customers with more than 10 orders'). "
+            "For aggregation: set group_by to the grouping columns (e.g. "
+            "['orders.customer_id']) and put comparison filters (e.g. "
+            "COUNT(*) > 10) in the 'having' list with a column like "
+            "'count_orders' or 'count(*)'.\n\n"
+            "If the user's request is genuinely ambiguous or you cannot map it "
+            "to a clear query, set action='clarify' and put your question in "
+            "the 'reasoning' field; do NOT guess a destructive action.\n\n"
+            "Shape:\n"
+            '{"action":"select"|"insert"|"update"|"delete"|"clarify",'
+            '"table":"...","filters":[{"column":"...","operator":"=","value":"..."}],'
+            '"group_by":["col",...],'
+            '"having":[{"column":"count_*","operator":">","value":10}],'
+            '"values":{...},"reasoning":"..."}\n\n'
+            f"Schema:\n{schema_text}\n\n"
+            "Rules: action must be one of the listed literals; "
+            "filter operators =, !=, >, <, >=, <=, IN, LIKE; "
+            "UPDATE/DELETE require >=1 filter (safety); "
+            "INSERT requires non-null values; "
+            "For SELECT with aggregation, also fill group_by / having."
         )
         try:
             structured_llm = self.llm.with_structured_output(ProposedAction)
@@ -198,10 +288,19 @@ class Agent:
             logger.error(f"LLM call failed: {exc}")
             return None, f"LLM error: {exc}"
 
-    def _validate_action(self, action: ProposedAction, tables: list) -> str | None:
+    def _validate_action(
+        self, action: ProposedAction, tables: list, request: str
+    ) -> str | None:
+        """Validate action against the live schema + a semantic sanity check."""
+        if not action.table:
+            return "Action must specify a table."
+
         table_info = get_table(tables, action.table)
         if table_info is None:
-            return f"Table '{action.table}' not found. Available: {[t.name for t in tables]}"
+            return (
+                f"Table '{action.table}' not found. "
+                f"Available: {[t.name for t in tables]}"
+            )
         for f in action.filters:
             if not column_exists(table_info, f.column):
                 return f"Column '{f.column}' not in '{action.table}'."
@@ -209,8 +308,30 @@ class Agent:
             for col in action.values.keys():
                 if not column_exists(table_info, col):
                     return f"Column '{col}' in values not in '{action.table}'."
+        for col in action.group_by:
+            if not column_exists(table_info, col):
+                return f"Group-by column '{col}' not in '{action.table}'."
         if action.action in ("update", "delete") and not action.filters:
             return f"Safety: {action.action.upper()} has no WHERE filters."
+
+        # Semantic sanity check: if the request clearly asks for aggregation
+        # but the agent produced a plain SELECT with no GROUP BY / HAVING,
+        # reject it rather than running a wrong-but-valid query.
+        if (
+            action.action == "select"
+            and not action.group_by
+            and not action.having
+            and _looks_like_aggregation_request(request)
+        ):
+            logger.warning(
+                "Semantic check: request looks like aggregation, but no "
+                "group_by/having provided."
+            )
+            return (
+                "Semantic check: request implies aggregation (e.g. 'more than N "
+                "per group') but action has no group_by / having. Agent should "
+                "either set action='clarify' or include group_by/having."
+            )
         return None
 
     def _request_approval(self, action: ProposedAction) -> bool:
@@ -223,7 +344,9 @@ class Agent:
             logger.error(f"Approval raised: {exc} — denying")
             return False
 
-    def _execute_action(self, action: ProposedAction) -> tuple[str | None, str | None, list | None]:
+    def _execute_action(
+        self, action: ProposedAction
+    ) -> tuple[str | None, str | None, list | None]:
         try:
             with get_connection() as conn, conn.cursor() as cur:
                 if action.action == "select":
@@ -259,7 +382,10 @@ class Agent:
             logger.error(f"DB execution failed: {exc}")
             return None, f"DB error: {exc}", None
 
-    def _result(self, raw_action, sql, executed, approval_required, approved, rows, error):
+    def _result(
+        self, raw_action, sql, executed, approval_required, approved,
+        rows, error, clarification=None,
+    ):
         return {
             "raw_action": raw_action,
             "sql": sql,
@@ -268,11 +394,15 @@ class Agent:
             "approved": approved,
             "rows": rows,
             "error": error,
+            "clarification": clarification,
         }
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     def cli_approval(action: ProposedAction) -> bool:
         print(f"\n[APPROVAL REQUIRED] {action.action.upper()} on {action.table}")

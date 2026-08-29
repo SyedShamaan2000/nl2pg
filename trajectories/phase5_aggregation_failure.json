@@ -1,0 +1,36 @@
+{
+  "phase": 5,
+  "date": "2026-08-30",
+  "failure_mode": "LLM ignores GROUP BY/HAVING for aggregation requests",
+  "description": "When asked 'give me customers with more than 10 orders', the LLM produced a naive SELECT * FROM orders with no aggregation. The reasoning claimed 'current schema does not support GROUP BY or HAVING clauses' — factually wrong.",
+  "request": "give me customers with more than 10 orders",
+  "before": {
+    "raw_action": {
+      "action": "select",
+      "table": "orders",
+      "filters": [],
+      "group_by": [],
+      "having": [],
+      "values": null,
+      "reasoning": "To find customers with more than 10 orders, we first need to retrieve all orders to aggregate and count them by customer_id in the application layer, as the current schema does not support GROUP BY or HAVING clauses."
+    },
+    "sql": "SELECT * FROM orders;",
+    "executed": true,
+    "error": null,
+    "issue": "Wrong table (should query customers, not orders directly); no aggregation; returns raw orders instead of customers grouped by count"
+  },
+  "after_fix": {
+    "changes": [
+      "Added group_by and having fields to ProposedAction schema",
+      "build_sql() now supports SELECT with GROUP BY ... HAVING ...",
+      "Added _looks_like_aggregation_request() heuristic to detect aggregation intent",
+      "Added semantic validation in _validate_action() — rejects SELECT with no group_by/having when request implies aggregation",
+      "System prompt updated: explicitly tells LLM Postgres supports GROUP BY, HAVING, JOIN, subqueries with examples"
+    ],
+    "validation_behavior": "Semantic check now catches the mismatch and returns validation error instead of executing wrong query",
+    "correct_behavior": "LLM should produce group_by=['orders.customer_id'] + having=[Filter(column='count_orders', operator='>', value=10)] OR action='clarify' if intent is truly ambiguous"
+  },
+  "evidence": {
+    "log_snippet": "LLM raw response: ProposedAction(action='select', table='orders', filters=[], values=None, reasoning='...current schema does not support GROUP BY...')\nExecuting SELECT: SELECT * FROM orders;\nSELECT returned 5 row(s)"
+  }
+}

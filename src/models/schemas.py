@@ -10,7 +10,7 @@ class AgentOutputParseError(Exception):
 
 
 class Filter(BaseModel):
-    """A single WHERE clause filter."""
+    """A single WHERE / HAVING clause filter."""
 
     column: str
     operator: Literal["=", "!=", ">", "<", ">=", "<=", "IN", "LIKE"] = "="
@@ -18,11 +18,19 @@ class Filter(BaseModel):
 
 
 class ProposedAction(BaseModel):
-    """The agent's proposed database action (boundary object)."""
+    """The agent's proposed database action (boundary object).
 
-    action: Literal["select", "insert", "update", "delete"]
-    table: str
+    Supports basic SELECT, INSERT, UPDATE, DELETE. For aggregation queries
+    (e.g. "customers with more than 10 orders"), use group_by and having.
+    The agent may also return action="clarify" when the intent is ambiguous,
+    in which case `reasoning` carries the clarification question.
+    """
+
+    action: Literal["select", "insert", "update", "delete", "clarify"]
+    table: str = ""
     filters: list[Filter] = Field(default_factory=list)
+    group_by: list[str] = Field(default_factory=list)
+    having: list[Filter] = Field(default_factory=list)
     values: dict[str, Any] | None = None
     reasoning: str
 
