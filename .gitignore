@@ -55,3 +55,6 @@ instructions/
 # Virtual Environments
 venv/
 .venv/
+
+# Developer-specific files - for now
+DeveloperNotes.md

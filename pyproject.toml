@@ -1,0 +1,33 @@
+[project]
+name = "nl2pg"
+version = "0.1.0"
+description = "NL-to-Safe-Query Agent for Postgres"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "psycopg2-binary>=2.9",
+    "python-dotenv>=1.0",
+    "yoyo-migrations>=8.0",
+    "openai>=1.30",
+    "rich>=13.7",
+    "typer>=0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.9",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
