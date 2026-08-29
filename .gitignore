@@ -52,3 +52,6 @@ tests/
 # READMEs - Agent Instructions
 instructions/
 
+# Virtual Environments
+venv/
+.venv/
