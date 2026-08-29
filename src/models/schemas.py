@@ -1,11 +1,17 @@
 """Pydantic models for agent outputs and schema definitions."""
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
+
+
+class AgentOutputParseError(Exception):
+    """Raised when LLM output cannot be parsed/validated into a Pydantic model."""
 
 
 class Filter(BaseModel):
     """A single WHERE clause filter."""
+
     column: str
     operator: Literal["=", "!=", ">", "<", ">=", "<=", "IN", "LIKE"] = "="
     value: Any
@@ -13,6 +19,7 @@ class Filter(BaseModel):
 
 class ProposedAction(BaseModel):
     """The agent's proposed database action (boundary object)."""
+
     action: Literal["select", "insert", "update", "delete"]
     table: str
     filters: list[Filter] = Field(default_factory=list)
@@ -22,6 +29,7 @@ class ProposedAction(BaseModel):
 
 class ColumnInfo(BaseModel):
     """Schema column metadata."""
+
     name: str
     type: str
     nullable: bool = True
@@ -33,5 +41,6 @@ class ColumnInfo(BaseModel):
 
 class TableInfo(BaseModel):
     """Schema table metadata."""
+
     name: str
     columns: list[ColumnInfo]
