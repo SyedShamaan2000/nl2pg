@@ -48,3 +48,7 @@ logs/
 # Test data (seed data should be regenerated from scripts)
 tests/
 *.csv
+
+# READMEs - Agent Instructions
+instructions/
+
