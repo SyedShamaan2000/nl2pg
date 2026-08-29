@@ -1,0 +1,50 @@
+# Database
+# Postgres data should never be committed
+*.db
+*.sqlite
+*.backup
+*.dump
+
+# yoyo configuration (templates, not actual config)
+yoyo.yaml
+
+# Environment files (real secrets should never be committed)
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Test data (seed data should be regenerated from scripts)
+tests/
+*.csv
