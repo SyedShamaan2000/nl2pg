@@ -16,7 +16,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
-      - lp_net
+      - nl2pg_net
 
   pgadmin:
     image: dpage/pgadmin4
@@ -37,6 +37,6 @@ volumes:
 
 # Define the network
 networks:
-  lp_net:
+  nl2pg_net:
     name: shared_nl2pg_net
     external: true
