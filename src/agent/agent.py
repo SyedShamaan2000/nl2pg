@@ -1,4 +1,19 @@
-"""Schema-aware, validated NL-to-SQL agent (v3).
+"""Schema-aware, validated NL-to-SQL agent (v4).
+
+Iteration 4 changes vs v3:
+  - Pre-insert UNIQUE-constraint check: introspect now reports which columns
+    have a UNIQUE constraint, and before executing an INSERT we SELECT
+    existing rows on those columns to catch duplicates ahead of time. The
+    raw psycopg2 "duplicate key value violates unique constraint" error is
+    now a friendly, actionable message — and the failing row is never sent
+    to the DB (see eval case W01).
+  - Friendly error mapping for DB-side errors: psycopg2 IntegrityError
+    messages are translated into one-line human-friendly descriptions
+    (unique violation, FK violation, NOT NULL violation, check violation)
+    before they reach the caller.
+  - NULL/NOT-NULL precheck on INSERT: if the LLM omits a value for a
+    NOT NULL column that has no DEFAULT, we fail fast with a clear message
+    instead of letting psycopg2 raise a generic error.
 
 Iteration 3 changes vs v2:
   - JOIN support: 'joins' field on ProposedAction lets the agent express
@@ -26,6 +41,7 @@ import logging
 import os
 from typing import Any, Literal
 
+import psycopg2
 from dotenv import load_dotenv
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -228,6 +244,68 @@ def _strip_default_columns(action: ProposedAction, table_info: TableInfo) -> lis
     return dropped
 
 
+def _check_unique_conflicts(action: ProposedAction, table_info: TableInfo) -> str | None:
+    """Pre-flight check: return an error string if any INSERT value
+    would violate a UNIQUE constraint on the target table.
+
+    For every column the LLM supplied that is flagged is_unique on the
+    schema, we SELECT existing rows with that value and report the
+    conflict immediately — before we ever hand a statement to Postgres.
+    Returns None when no conflicts are found.
+    """
+    if action.action != "insert" or not action.values:
+        return None
+    for col_name, value in action.values.items():
+        col = next(
+            (c for c in table_info.columns if c.name.lower() == col_name.lower()),
+            None,
+        )
+        if col is None or not col.is_unique or value is None:
+            continue
+        qualified = f"{action.table}.{col_name}"
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT 1 FROM {action.table} WHERE {col_name} = %s LIMIT 1",
+                (value,),
+            )
+            if cur.fetchone() is not None:
+                return (
+                    f"Unique constraint violation: a row with {qualified}="
+                    f"{_quote_literal(value)} already exists in {action.table}. "
+                    f"Please use a different value or update the existing row."
+                )
+    return None
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Return a one-line human-friendly description of a DB execution error."""
+    # psycopg2.IntegrityError (UNIQUE / FK / NOT NULL / CHECK violations)
+    if isinstance(exc, psycopg2.IntegrityError):
+        msg = str(exc).split("\n")[0]
+        low = msg.lower()
+        if "unique constraint" in low:
+            # Extract the column/key hint if present: "...Key (col)=(val)..."
+            detail = ""
+            parts = str(exc).split("\n")
+            if len(parts) > 1 and parts[1].strip().startswith("DETAIL:"):
+                detail = " " + parts[1].strip()
+            return f"Duplicate value: {msg}.{detail}"
+        if "foreign key constraint" in low or "insert or update on table" in low:
+            return f"Foreign-key violation: {msg}"
+        if "not-null" in low or "null value" in low:
+            return f"NOT NULL violation: {msg}"
+        if "check constraint" in low:
+            return f"Check constraint violation: {msg}"
+        return f"Integrity error: {msg}"
+    if isinstance(exc, psycopg2.errors.ForeignKeyViolation):
+        return f"Foreign-key violation: {exc}"
+    if isinstance(exc, psycopg2.errors.UniqueViolation):
+        return f"Duplicate value: {exc}"
+    if isinstance(exc, psycopg2.errors.NotNullViolation):
+        return f"NOT NULL violation: {exc}"
+    return str(exc)
+
+
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
@@ -340,6 +418,48 @@ class Agent:
             dropped = _strip_default_columns(raw_action, table_info)
             if dropped:
                 logger.info(f"Stripped auto-generated column(s) from INSERT values: {dropped}")
+            # Pre-flight unique-constraint check: catch duplicates before
+            # they ever reach the DB, with an actionable message.
+            unique_err = _check_unique_conflicts(raw_action, table_info)
+            if unique_err:
+                logger.warning(f"Unique constraint precheck failed: {unique_err}")
+                return self._result(
+                    raw_action=raw_action.model_dump(),
+                    sql=None,
+                    executed=False,
+                    approval_required=True,
+                    approved=True,
+                    rows=None,
+                    error=unique_err,
+                )
+
+            # Pre-flight checks for INSERT: required columns (NOT NULL, no DEFAULT)
+            for col in table_info.columns:
+                if (
+                    not col.nullable
+                    and not col.has_default
+                    and col.name not in (raw_action.values or {})
+                ):
+                    return self._result(
+                        raw_action=raw_action.model_dump(),
+                        sql=None,
+                        executed=False,
+                        approval_required=False,
+                        approved=None,
+                        rows=None,
+                        error=f"Validation error: Missing required column '{col.name}' for INSERT.",
+                    )
+            dup_error = _check_unique_conflicts(raw_action, table_info)
+            if dup_error:
+                return self._result(
+                    raw_action=raw_action.model_dump(),
+                    sql=None,
+                    executed=False,
+                    approval_required=False,
+                    approved=None,
+                    rows=None,
+                    error=dup_error,
+                )
 
         is_write = raw_action.action in ("insert", "update", "delete")
         if is_write:
@@ -424,7 +544,10 @@ class Agent:
             "'DEFAULT' in the schema below — this includes primary keys "
             "like 'id' and timestamp columns like 'created_at' / "
             "'updated_at' — unless the user's request explicitly gives "
-            "that exact value. Let the database fill these in.\n\n"
+            "that exact value. Let the database fill these in. Also, "
+            "columns marked 'UNIQUE' in the schema must not duplicate "
+            "an existing value; the agent should validate this before "
+            "submitting an INSERT.\n\n"
             "If the user's request is genuinely ambiguous or you cannot map "
             "it to a clear query, set action='clarify' and put your "
             "question in the 'reasoning' field; do NOT guess a destructive "
@@ -591,6 +714,15 @@ class Agent:
                     return sql, None, [{"rows_affected": rows_affected}]
                 else:
                     return None, f"Unknown action: {action.action}", None
+        except psycopg2.IntegrityError as exc:
+            # Roll back the transaction so the next query on this connection
+            # isn't poisoned by the aborted state.
+            try:
+                conn.rollback()
+            except Exception:
+                logger.error("Failed to rollback after integrity error")
+            logger.error(f"DB integrity error: {exc}")
+            return None, _friendly_error(exc), None
         except Exception as exc:
             logger.error(f"DB execution failed: {exc}")
             return None, f"DB error: {exc}", None

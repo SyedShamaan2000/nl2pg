@@ -80,6 +80,10 @@ class ColumnInfo(BaseModel):
     # to avoid inventing values (e.g. a placeholder id) for columns the
     # database will populate itself.
     has_default: bool = False
+    # True when the column has a UNIQUE constraint (single-column or part of
+    # a composite unique index). The agent uses this to pre-check INSERT
+    # values for uniqueness violations before execution.
+    is_unique: bool = False
 
 
 class TableInfo(BaseModel):

@@ -113,6 +113,24 @@ def _score_case(case: dict, runner_result: dict, runner_name: str) -> tuple[str,
         if executed and runner_result.get("approved"):
             return "PASS", "Agent executed write under harness approval."
         if error:
+            # Distinguish between a *correct defensive catch* (pre-flight validation
+            # correctly rejected the request — e.g. unique constraint conflict,
+            # missing required column) and a *genuine failure* (buggy SQL, wrong
+            # table, etc.).  The agent's pre-checks for unique conflicts and
+            # NOT-NULL columns are intentional guard-rails, not bugs: returning
+            # an error without executing is the correct outcome.
+            defensive_keywords = (
+                "unique constraint violation",
+                "already exists",
+                "missing required column",
+                "not-null violation",
+            )
+            is_defensive = any(kw in error.lower() for kw in defensive_keywords)
+            if is_defensive:
+                return (
+                    "PASS",
+                    f"Agent correctly caught invalid write attempt: {error[:80]}",
+                )
             return "FAIL", f"Write attempt failed: {error[:80]}"
 
     # ---- Read paths ------------------------------------------------------

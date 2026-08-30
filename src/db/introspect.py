@@ -89,6 +89,25 @@ def _fetch_foreign_keys(conn: Any) -> dict[tuple[str, str], tuple[str, str]]:
         return fks
 
 
+def _fetch_unique_constraints(conn: Any) -> dict[str, set[str]]:
+    """Return a mapping of table_name -> set of column names with UNIQUE constraints."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT tc.table_name, kcu.column_name
+            FROM information_schema.table_constraints AS tc
+            JOIN information_schema.key_column_usage AS kcu
+              ON tc.constraint_name = kcu.constraint_name
+            WHERE tc.constraint_type = 'UNIQUE'
+              AND tc.table_schema = 'public'
+            """
+        )
+        uniques: dict[str, set[str]] = {}
+        for table_name, column_name in cur.fetchall():
+            uniques.setdefault(table_name, set()).add(column_name)
+        return uniques
+
+
 def introspect_schema() -> list[TableInfo]:
     """Introspect the live Postgres schema and return validated TableInfo objects.
 
@@ -101,6 +120,7 @@ def introspect_schema() -> list[TableInfo]:
         cols_by_table = _fetch_columns(conn)
         pks = _fetch_primary_keys(conn)
         fks = _fetch_foreign_keys(conn)
+        uniques = _fetch_unique_constraints(conn)
 
     tables: list[TableInfo] = []
     for table_name, raw_cols in sorted(cols_by_table.items()):
@@ -108,6 +128,7 @@ def introspect_schema() -> list[TableInfo]:
             logger.debug(f"Skipping excluded table: {table_name}")
             continue
         pk_cols = pks.get(table_name, set())
+        unique_cols = uniques.get(table_name, set())
         column_infos: list[ColumnInfo] = []
         for col in raw_cols:
             fk = fks.get((table_name, col["name"]))
@@ -121,6 +142,7 @@ def introspect_schema() -> list[TableInfo]:
                     foreign_table=fk[0] if fk else None,
                     foreign_column=fk[1] if fk else None,
                     has_default=col["has_default"],
+                    is_unique=col["name"] in unique_cols,
                 )
             )
         tables.append(TableInfo(name=table_name, columns=column_infos))
@@ -152,6 +174,8 @@ def schema_to_text(tables: list[TableInfo]) -> str:
                 notes.append("NOT NULL")
             if c.has_default:
                 notes.append("DEFAULT")
+            if c.is_unique:
+                notes.append("UNIQUE")
             lines.append(f"  - {c.name} ({', '.join(notes)})")
         lines.append("")
     return "\n".join(lines).rstrip()
