@@ -24,19 +24,23 @@ def _fetch_columns(conn: Any) -> dict[str, list[dict[str, Any]]]:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT table_name, column_name, data_type, is_nullable
+            SELECT table_name, column_name, data_type, is_nullable, column_default
             FROM information_schema.columns
             WHERE table_schema = 'public'
             ORDER BY table_name, ordinal_position
             """
         )
         cols_by_table: dict[str, list[dict[str, Any]]] = {}
-        for table_name, column_name, data_type, is_nullable in cur.fetchall():
+        for table_name, column_name, data_type, is_nullable, column_default in cur.fetchall():
             cols_by_table.setdefault(table_name, []).append(
                 {
                     "name": column_name,
                     "type": data_type,
                     "nullable": is_nullable == "YES",
+                    # column_default is non-NULL for SERIAL/IDENTITY columns,
+                    # gen_random_uuid()-style defaults, now()-style timestamp
+                    # defaults, etc.
+                    "has_default": column_default is not None,
                 }
             )
         return cols_by_table
@@ -116,6 +120,7 @@ def introspect_schema() -> list[TableInfo]:
                     is_foreign_key=fk is not None,
                     foreign_table=fk[0] if fk else None,
                     foreign_column=fk[1] if fk else None,
+                    has_default=col["has_default"],
                 )
             )
         tables.append(TableInfo(name=table_name, columns=column_infos))
@@ -128,7 +133,9 @@ def schema_to_text(tables: list[TableInfo]) -> str:
     """Render TableInfo list as a compact text description for LLM context.
 
     Format is kept stable and human-readable so the LLM can parse it reliably.
-    Includes column types, nullability, PK, and FK relationships.
+    Includes column types, nullability, PK, FK relationships, and whether a
+    column has a DB-side DEFAULT (so the agent knows not to invent a value
+    for it, e.g. a generated id or a created_at timestamp).
     """
     if not tables:
         return "(no tables in public schema)"
@@ -143,6 +150,8 @@ def schema_to_text(tables: list[TableInfo]) -> str:
                 notes.append(f"FK->{c.foreign_table}.{c.foreign_column}")
             if not c.nullable:
                 notes.append("NOT NULL")
+            if c.has_default:
+                notes.append("DEFAULT")
             lines.append(f"  - {c.name} ({', '.join(notes)})")
         lines.append("")
     return "\n".join(lines).rstrip()
@@ -168,7 +177,9 @@ if __name__ == "__main__":
     # Manual smoke test.
     from src.logging_config import logger as _  # noqa: F401  ensure logging is configured
 
-    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
     for t in introspect_schema():
         print(t.name, "->", [c.name for c in t.columns])
     print("---")

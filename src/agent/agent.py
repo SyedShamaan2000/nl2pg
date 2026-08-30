@@ -1,22 +1,37 @@
-"""Schema-aware, validated NL-to-SQL agent (v2).
+"""Schema-aware, validated NL-to-SQL agent (v3).
+
+Iteration 3 changes vs v2:
+  - JOIN support: 'joins' field on ProposedAction lets the agent express
+    multi-table queries properly instead of smuggling a subquery into a
+    filter value (which used to get quoted as a string literal and break —
+    see eval case R03). Aggregation across a join (e.g. "customers with
+    more than 10 orders") also relies on this — see R04.
+  - Safe SQL literal quoting: _quote_literal used to be Python's repr(),
+    which follows Python escaping rules, not SQL's. Replaced with proper
+    single-quote doubling.
+  - INSERT no longer lets the LLM invent values for auto-generated columns
+    (id, created_at, ...). The schema now reports which columns have a DB
+    DEFAULT, the prompt tells the LLM to leave those alone, and a
+    deterministic backstop strips them from `values` even if the LLM
+    ignores the instruction (see eval case W01).
 
 Iteration 2 changes vs v1:
-  - Aggregation support: 'group_by' and 'having' fields on ProposedAction
-    (Fixes: "customers with more than 10 orders" — no more naive SELECT *).
+  - Aggregation support: 'group_by' and 'having' fields on ProposedAction.
   - 'clarify' action: agent can ask for clarification instead of guessing.
-  - System prompt now tells the LLM that Postgres supports GROUP BY, HAVING,
-    JOIN, subqueries — explicitly with examples.
-  - Semantic validation: catches obviously wrong queries (ambiguous table
-    selection, etc.) before execution.
+  - Semantic validation: catches obviously wrong queries before execution.
+  - Multi-provider support: Groq and Gemini.
 """
 
 import logging
 import os
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 
+from src.agent.rate_limit import invoke_with_backoff
 from src.db.connection import get_connection
 from src.db.introspect import (
     column_exists,
@@ -24,11 +39,62 @@ from src.db.introspect import (
     introspect_schema,
     schema_to_text,
 )
-from src.models.schemas import Filter, ProposedAction
+from src.models.schemas import Filter, ProposedAction, TableInfo
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# LLM Initializer Functions
+# ---------------------------------------------------------------------------
+
+
+def _init_gemini(
+    model_name: str = "gemini-3.5-flash", temperature: float = 0.3
+) -> ChatGoogleGenerativeAI:
+    """Initialize and return a Gemini LLM instance."""
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
+    if not api_key:
+        logger.warning("GOOGLE_API_KEY / GEMINI_API_KEY not set; Gemini LLM calls will fail.")
+
+    return ChatGoogleGenerativeAI(
+        model=model_name,
+        temperature=temperature,
+        google_api_key=api_key if api_key else None,
+        max_retries=2,  # Prevent infinite hangs on 429 quota errors
+    )
+
+
+def _init_groq(model_name: str = "openai/gpt-oss-120b", temperature: float = 0.3) -> ChatGroq:
+    """Initialize and return a Groq LLM instance."""
+    api_key = os.getenv("GROQ_API_KEY") or ""
+    if not api_key:
+        logger.warning("GROQ_API_KEY not set; Groq LLM calls will fail.")
+
+    return ChatGroq(
+        model_name=model_name,
+        temperature=temperature,
+        groq_api_key=api_key if api_key else None,
+        max_retries=2,
+    )
+
+
+def get_llm(
+    provider: Literal["groq", "gemini"] = "groq",
+    model_name: str | None = None,
+    temperature: float = 0.3,
+) -> BaseChatModel:
+    """Factory function to instantiate an LLM based on provider choice."""
+    if provider == "groq":
+        target_model = model_name or "openai/gpt-oss-120b"
+        return _init_groq(model_name=target_model, temperature=temperature)
+    elif provider == "gemini":
+        target_model = model_name or "gemini-3.5-flash"
+        return _init_gemini(model_name=target_model, temperature=temperature)
+    else:
+        raise ValueError(f"Unsupported LLM provider: {provider}. Choose 'groq' or 'gemini'.")
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +110,16 @@ def _quote_literal(val: Any) -> str:
         return "TRUE" if val else "FALSE"
     if isinstance(val, (int, float)):
         return str(val)
-    return repr(str(val))
+    escaped = str(val).replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _split_qualified(col: str) -> tuple[str | None, str]:
+    """Split 'table.column' into (table, column); 'column' -> (None, column)."""
+    if "." in col:
+        table, _, column = col.partition(".")
+        return table, column
+    return None, col
 
 
 def _render_filter(f: Filter) -> str:
@@ -61,18 +136,32 @@ def _render_filter(f: Filter) -> str:
     return f"{f.column} {f.operator} {_quote_literal(val)}"
 
 
-def build_sql(action: ProposedAction) -> str:
-    """Build SQL from a ProposedAction. Supports aggregation via group_by / having.
+def _build_from_clause(action: ProposedAction) -> str:
+    """Build the FROM clause, including any JOINs. Table/column names here
+    have already been checked against the introspected schema in
+    _validate_action, so this is not interpolating arbitrary user text."""
+    from_clause = action.table
+    for j in action.joins:
+        keyword = "LEFT JOIN" if j.join_type == "LEFT" else "JOIN"
+        from_clause += f" {keyword} {j.table} ON {j.on_left} = {j.on_right}"
+    return from_clause
 
-    SELECT with group_by: SELECT <group_by cols> FROM <table> [WHERE ...]
+
+def build_sql(action: ProposedAction) -> str:
+    """Build SQL from a ProposedAction. Supports JOINs and aggregation
+    (group_by / having) for SELECT.
+
+    SELECT with group_by: SELECT <cols> FROM <table> [JOIN ...] [WHERE ...]
                           GROUP BY <cols> [HAVING ...]
-    SELECT without group_by: SELECT * FROM <table> [WHERE ...]
-    UPDATE / DELETE take the WHERE clause from filters only.
+    SELECT without group_by: SELECT <cols> FROM <table> [JOIN ...] [WHERE ...]
+    UPDATE / DELETE take the WHERE clause from filters only, and never join
+    (see ProposedAction docstring for why).
     """
     table = action.table
     filters = action.filters
     group_by = action.group_by
     having = action.having
+    from_clause = _build_from_clause(action)
 
     where = ""
     if filters:
@@ -80,18 +169,20 @@ def build_sql(action: ProposedAction) -> str:
         where = f" WHERE {clauses}"
 
     if action.action == "select":
+        # With a join in play, "*" would be ambiguous / return columns from
+        # every joined table, so scope it to the primary table the request
+        # is actually about.
+        select_cols = f"{table}.*" if action.joins else "*"
         if group_by:
             group_clause = ", ".join(group_by)
             having_clause = ""
             if having:
-                having_clause = (
-                    " HAVING " + " AND ".join(_render_filter(f) for f in having)
-                )
+                having_clause = " HAVING " + " AND ".join(_render_filter(f) for f in having)
             return (
-                f"SELECT {group_clause} FROM {table}{where} "
+                f"SELECT {select_cols} FROM {from_clause}{where} "
                 f"GROUP BY {group_clause}{having_clause};"
             )
-        return f"SELECT * FROM {table}{where};"
+        return f"SELECT {select_cols} FROM {from_clause}{where};"
     if action.action == "update":
         if not action.values:
             raise ValueError("UPDATE action requires non-None values")
@@ -106,6 +197,35 @@ def _build_insert_sql(table: str, values: dict[str, Any]) -> str:
     cols = ", ".join(values.keys())
     vals = ", ".join(_quote_literal(v) for v in values.values())
     return f"INSERT INTO {table} ({cols}) VALUES ({vals});"
+
+
+def _strip_default_columns(action: ProposedAction, table_info: TableInfo) -> list[str]:
+    """Remove auto-generated columns from an INSERT's values before building SQL.
+
+    The system prompt tells the LLM not to supply these, but this is a
+    deterministic backstop: if it does anyway (e.g. inventing a placeholder
+    id like "generated-uuid", or a literal string "now()" for a timestamp),
+    we drop them here rather than let a bad value reach the DB.
+
+    Only strips columns that both (a) have a DB DEFAULT and (b) are either
+    the primary key or a conventional auto-timestamp column name. A
+    legitimate, explicit override of some other defaulted column is left
+    alone — this is a narrow safety net, not a blanket filter.
+
+    Returns the list of column names that were dropped, for logging.
+    """
+    if action.action != "insert" or not action.values:
+        return []
+    auto_timestamp_names = {"created_at", "updated_at"}
+    dropped: list[str] = []
+    for col_name in list(action.values.keys()):
+        col = next((c for c in table_info.columns if c.name.lower() == col_name.lower()), None)
+        if col is None or not col.has_default:
+            continue
+        if col.is_primary_key or col.name.lower() in auto_timestamp_names:
+            dropped.append(col_name)
+            del action.values[col_name]
+    return dropped
 
 
 # ---------------------------------------------------------------------------
@@ -146,33 +266,42 @@ def _looks_like_aggregation_request(request: str) -> bool:
 
 
 class Agent:
-    def __init__(self, approval_fn: Any = None) -> None:
+    def __init__(
+        self,
+        approval_fn: Any = None,
+        provider: Literal["groq", "gemini"] | None = None,
+        model_name: str | None = None,
+    ) -> None:
         self._approval_fn = approval_fn
         self._tables: list | None = None
-        api_key = os.getenv("GEMINI_API_KEY") or ""
-        if not api_key:
-            logger.warning("GEMINI_API_KEY not set; agent LLM calls will fail.")
-        kwargs: dict[str, object] = {"model": "gemini-3.5-flash", "temperature": 0.3}
-        if api_key:
-            kwargs["google_api_key"] = api_key
-        self.llm = ChatGoogleGenerativeAI(**kwargs)  # type: ignore[arg-type]
+
+        # Fallback to env var or default to Groq
+        selected_provider = provider or os.getenv("LLM_PROVIDER", "groq").lower()  # type: ignore[assignment]
+        self.llm = get_llm(
+            provider=selected_provider,
+            model_name=model_name,
+            temperature=0.3,
+        )
 
     def run(self, request: str) -> dict[str, Any]:
         logger.info(f"Agent received request: {request!r}")
         tables = self._get_schema()
         schema_text = schema_to_text(tables)
         logger.debug(
-            f"Schema context sent to agent ({len(schema_text)} chars):\n"
-            f"{schema_text[:500]}..."
+            f"Schema context sent to agent ({len(schema_text)} chars):\n{schema_text[:500]}..."
         )
 
         raw_action, parse_error = self._generate_action(request, schema_text)
         if parse_error:
             logger.error(f"Agent output parse error: {parse_error}")
             return self._result(
-                raw_action=None, sql=None, executed=False,
-                approval_required=False, approved=None,
-                rows=None, error=parse_error,
+                raw_action=None,
+                sql=None,
+                executed=False,
+                approval_required=False,
+                approved=None,
+                rows=None,
+                error=parse_error,
             )
 
         logger.debug(f"Agent parsed ProposedAction: {raw_action!r}")
@@ -182,8 +311,10 @@ class Agent:
             logger.info("Agent requested clarification (no query executed).")
             return self._result(
                 raw_action=raw_action.model_dump(),
-                sql=None, executed=False,
-                approval_required=False, approved=None,
+                sql=None,
+                executed=False,
+                approval_required=False,
+                approved=None,
                 rows=None,
                 error=None,
                 clarification=raw_action.reasoning,
@@ -194,10 +325,21 @@ class Agent:
             logger.warning(f"Schema/semantic validation failed: {validation_error}")
             return self._result(
                 raw_action=raw_action.model_dump(),
-                sql=None, executed=False,
-                approval_required=False, approved=None,
-                rows=None, error=f"Validation error: {validation_error}",
+                sql=None,
+                executed=False,
+                approval_required=False,
+                approved=None,
+                rows=None,
+                error=f"Validation error: {validation_error}",
             )
+
+        # Deterministic backstop: never let an LLM-invented value for an
+        # auto-generated column (id, created_at, ...) reach an INSERT.
+        if raw_action.action == "insert":
+            table_info = get_table(tables, raw_action.table)
+            dropped = _strip_default_columns(raw_action, table_info)
+            if dropped:
+                logger.info(f"Stripped auto-generated column(s) from INSERT values: {dropped}")
 
         is_write = raw_action.action in ("insert", "update", "delete")
         if is_write:
@@ -209,9 +351,12 @@ class Agent:
             if not approved:
                 return self._result(
                     raw_action=raw_action.model_dump(),
-                    sql=None, executed=False,
-                    approval_required=True, approved=False,
-                    rows=None, error="Approval denied.",
+                    sql=None,
+                    executed=False,
+                    approval_required=True,
+                    approved=False,
+                    rows=None,
+                    error="Approval denied.",
                 )
 
         sql, exec_error, rows_result = self._execute_action(raw_action)
@@ -219,18 +364,21 @@ class Agent:
             logger.error(f"Execution error: {exec_error}")
             return self._result(
                 raw_action=raw_action.model_dump(),
-                sql=sql, executed=False,
-                approval_required=is_write, approved=is_write,
-                rows=None, error=exec_error,
+                sql=sql,
+                executed=False,
+                approval_required=is_write,
+                approved=is_write,
+                rows=None,
+                error=exec_error,
             )
 
-        logger.info(
-            f"Action executed successfully: {raw_action.action} on {raw_action.table}"
-        )
+        logger.info(f"Action executed successfully: {raw_action.action} on {raw_action.table}")
         return self._result(
             raw_action=raw_action.model_dump(),
-            sql=sql, executed=True,
-            approval_required=is_write, approved=is_write,
+            sql=sql,
+            executed=True,
+            approval_required=is_write,
+            approved=is_write,
             rows=rows_result,
             error=None,
         )
@@ -251,36 +399,59 @@ class Agent:
         system_prompt = (
             "You are a Postgres query planner. Output ONLY JSON matching the "
             "ProposedAction schema. "
-            "Postgres supports GROUP BY, HAVING, JOIN, and subqueries — use them "
-            "when the request asks for counts, totals, or comparisons across "
-            "groups (e.g. 'customers with more than 10 orders'). "
-            "For aggregation: set group_by to the grouping columns (e.g. "
-            "['orders.customer_id']) and put comparison filters (e.g. "
-            "COUNT(*) > 10) in the 'having' list with a column like "
-            "'count_orders' or 'count(*)'.\n\n"
-            "If the user's request is genuinely ambiguous or you cannot map it "
-            "to a clear query, set action='clarify' and put your question in "
-            "the 'reasoning' field; do NOT guess a destructive action.\n\n"
+            "Postgres supports GROUP BY, HAVING, JOIN, and subqueries — use "
+            "them when the request asks for counts, totals, or comparisons "
+            "across groups (e.g. 'customers with more than 10 orders').\n\n"
+            "JOINS: if answering the request needs columns from more than "
+            "one table (e.g. filtering orders by a customer attribute, or "
+            "counting a related table's rows), set 'table' to the primary "
+            "table you want rows from, and add an entry to 'joins' for each "
+            "other table you need. Each join needs 'table', 'on_left' and "
+            "'on_right' as fully qualified 'table.column' references (e.g. "
+            "on_left='orders.customer_id', on_right='customers.id'), and "
+            "'join_type' ('INNER' or 'LEFT'). Do NOT put a subquery or "
+            "another table's name inside a filter value — use 'joins' "
+            "instead. Once tables are joined, filters/group_by/having may "
+            "reference columns from any joined table as 'table.column'.\n\n"
+            "AGGREGATION: set group_by to the grouping columns (e.g. "
+            "['customers.id']) and put comparison filters in 'having' with "
+            "a column that is a full aggregate expression, e.g. "
+            "{'column': 'COUNT(orders.id)', 'operator': '>', 'value': 10}. "
+            "Grouping by a table's primary key lets you also select that "
+            "table's other columns (Postgres allows this via functional "
+            "dependency on the primary key).\n\n"
+            "INSERT VALUES: never include a value for a column marked "
+            "'DEFAULT' in the schema below — this includes primary keys "
+            "like 'id' and timestamp columns like 'created_at' / "
+            "'updated_at' — unless the user's request explicitly gives "
+            "that exact value. Let the database fill these in.\n\n"
+            "If the user's request is genuinely ambiguous or you cannot map "
+            "it to a clear query, set action='clarify' and put your "
+            "question in the 'reasoning' field; do NOT guess a destructive "
+            "action.\n\n"
             "Shape:\n"
             '{"action":"select"|"insert"|"update"|"delete"|"clarify",'
-            '"table":"...","filters":[{"column":"...","operator":"=","value":"..."}],'
+            '"table":"...",'
+            '"joins":[{"table":"...","on_left":"table.col","on_right":"table.col","join_type":"INNER"}],'
+            '"filters":[{"column":"...","operator":"=","value":"..."}],'
             '"group_by":["col",...],'
-            '"having":[{"column":"count_*","operator":">","value":10}],'
+            '"having":[{"column":"COUNT(*)","operator":">","value":10}],'
             '"values":{...},"reasoning":"..."}\n\n'
             f"Schema:\n{schema_text}\n\n"
             "Rules: action must be one of the listed literals; "
             "filter operators =, !=, >, <, >=, <=, IN, LIKE; "
-            "UPDATE/DELETE require >=1 filter (safety); "
-            "INSERT requires non-null values; "
-            "For SELECT with aggregation, also fill group_by / having."
+            "UPDATE/DELETE require >=1 filter (safety) and never use joins; "
+            "INSERT requires non-null values (excluding DEFAULT columns per "
+            "above); for SELECT with aggregation, also fill group_by / having."
         )
         try:
             structured_llm = self.llm.with_structured_output(ProposedAction)
-            response = structured_llm.invoke(
+            response = invoke_with_backoff(
+                structured_llm.invoke,
                 [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Request: {request}"},
-                ]
+                ],
             )
             logger.debug(f"LLM raw response: {response!r}")
             return response, None
@@ -288,29 +459,74 @@ class Agent:
             logger.error(f"LLM call failed: {exc}")
             return None, f"LLM error: {exc}"
 
-    def _validate_action(
-        self, action: ProposedAction, tables: list, request: str
-    ) -> str | None:
+    def _validate_action(self, action: ProposedAction, tables: list, request: str) -> str | None:
         """Validate action against the live schema + a semantic sanity check."""
         if not action.table:
             return "Action must specify a table."
 
         table_info = get_table(tables, action.table)
         if table_info is None:
-            return (
-                f"Table '{action.table}' not found. "
-                f"Available: {[t.name for t in tables]}"
-            )
+            return f"Table '{action.table}' not found. Available: {[t.name for t in tables]}"
+
+        if action.joins and action.action != "select":
+            return "Joins are only supported for SELECT actions."
+
+        # Validate joins and build a lookup of table_name -> TableInfo for
+        # every table now "in scope" (the main table plus any join tables),
+        # so filters / group_by / having can reference any of them.
+        tables_in_scope: dict[str, TableInfo] = {action.table: table_info}
+        for j in action.joins:
+            join_table_info = get_table(tables, j.table)
+            if join_table_info is None:
+                return f"Join table '{j.table}' not found. Available: {[t.name for t in tables]}"
+            tables_in_scope[j.table] = join_table_info
+
+            for qualified_col, side in ((j.on_left, "on_left"), (j.on_right, "on_right")):
+                qualifier, column = _split_qualified(qualified_col)
+                if qualifier is None or qualifier not in tables_in_scope:
+                    return (
+                        f"Join {side}='{qualified_col}' must be qualified as "
+                        f"'table.column' referencing a table already in "
+                        f"scope ({list(tables_in_scope)})."
+                    )
+                if not column_exists(tables_in_scope[qualifier], column):
+                    return f"Join column '{qualified_col}' does not exist."
+
+        def _check_column(qualified_col: str) -> str | None:
+            """Validate a possibly-qualified ('table.column') reference
+            against whichever table it names; unqualified names are checked
+            against the main table (preserves old single-table behavior)."""
+            qualifier, column = _split_qualified(qualified_col)
+            target_table = tables_in_scope.get(qualifier) if qualifier else table_info
+            if target_table is None:
+                return f"Column '{qualified_col}' references unknown table '{qualifier}'."
+            if not column_exists(target_table, column):
+                return f"Column '{qualified_col}' not in '{target_table.name}'."
+            return None
+
         for f in action.filters:
-            if not column_exists(table_info, f.column):
-                return f"Column '{f.column}' not in '{action.table}'."
+            err = _check_column(f.column)
+            if err:
+                return err
         if action.values:
             for col in action.values.keys():
+                # Values are always written to the main table — writes
+                # never join, see ProposedAction docstring.
                 if not column_exists(table_info, col):
                     return f"Column '{col}' in values not in '{action.table}'."
         for col in action.group_by:
-            if not column_exists(table_info, col):
-                return f"Group-by column '{col}' not in '{action.table}'."
+            err = _check_column(col)
+            if err:
+                return err
+        for f in action.having:
+            # HAVING columns are frequently aggregate expressions, e.g.
+            # "COUNT(orders.id)" — those aren't real columns, so only run
+            # the existence check on plain (non-expression) references.
+            if "(" not in f.column:
+                err = _check_column(f.column)
+                if err:
+                    return err
+
         if action.action in ("update", "delete") and not action.filters:
             return f"Safety: {action.action.upper()} has no WHERE filters."
 
@@ -324,8 +540,7 @@ class Agent:
             and _looks_like_aggregation_request(request)
         ):
             logger.warning(
-                "Semantic check: request looks like aggregation, but no "
-                "group_by/having provided."
+                "Semantic check: request looks like aggregation, but no group_by/having provided."
             )
             return (
                 "Semantic check: request implies aggregation (e.g. 'more than N "
@@ -344,9 +559,7 @@ class Agent:
             logger.error(f"Approval raised: {exc} — denying")
             return False
 
-    def _execute_action(
-        self, action: ProposedAction
-    ) -> tuple[str | None, str | None, list | None]:
+    def _execute_action(self, action: ProposedAction) -> tuple[str | None, str | None, list | None]:
         try:
             with get_connection() as conn, conn.cursor() as cur:
                 if action.action == "select":
@@ -383,8 +596,15 @@ class Agent:
             return None, f"DB error: {exc}", None
 
     def _result(
-        self, raw_action, sql, executed, approval_required, approved,
-        rows, error, clarification=None,
+        self,
+        raw_action,
+        sql,
+        executed,
+        approval_required,
+        approved,
+        rows,
+        error,
+        clarification=None,
     ):
         return {
             "raw_action": raw_action,
@@ -412,7 +632,12 @@ if __name__ == "__main__":
         resp = input("Approve? [y/N]: ").strip().lower()
         return resp == "y"
 
-    agent = Agent(approval_fn=cli_approval)
+    # Example 1: Instantiate with Groq (default)
+    agent = Agent(approval_fn=cli_approval, provider="groq")
+
+    # Example 2: Instantiate with Gemini
+    # agent = Agent(approval_fn=cli_approval, provider="gemini", model_name="gemini-3.5-flash")
+
     request = input("Enter request: ")
     result = agent.run(request)
     print("\n=== Result ===")
