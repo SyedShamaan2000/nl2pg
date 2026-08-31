@@ -5,6 +5,7 @@ Revision ID: 0001
 Revises:
 Create Date: 2026-08-30 00:00:00
 """
+from yoyo import step
 
 __depends__ = ()
 
@@ -44,3 +45,7 @@ def rollback(conn):
     cursor.execute("DROP TABLE IF EXISTS order_items CASCADE")
     cursor.execute("DROP TABLE IF EXISTS orders CASCADE")
     cursor.execute("DROP TABLE IF EXISTS customers CASCADE")
+
+steps = [
+    step(apply, rollback)
+]

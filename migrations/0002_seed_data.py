@@ -35,3 +35,7 @@ def apply(conn):
 
 def rollback(conn):
     pass
+
+steps = [
+    step(apply, rollback)
+]

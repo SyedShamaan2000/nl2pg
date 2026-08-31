@@ -61,6 +61,7 @@ class ProposedAction(BaseModel):
     filters: list[Filter] = Field(default_factory=list)
     group_by: list[str] = Field(default_factory=list)
     having: list[Filter] = Field(default_factory=list)
+    limit: int = Field(default_factory=list)
     values: dict[str, Any] | None = None
     reasoning: str
 
