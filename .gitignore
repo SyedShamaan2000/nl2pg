@@ -58,3 +58,5 @@ venv/
 
 # Developer-specific files - for now
 DeveloperNotes.md
+
+.continue/
