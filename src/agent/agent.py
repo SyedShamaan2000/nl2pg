@@ -352,12 +352,22 @@ class Agent:
     ) -> None:
         self._approval_fn = approval_fn
         self._tables: list | None = None
+        self._provider = provider
+        self._model_name = model_name
 
         # Fallback to env var or default to Groq
         selected_provider = provider or os.getenv("LLM_PROVIDER", "groq").lower()  # type: ignore[assignment]
         self.llm = get_llm(
             provider=selected_provider,
             model_name=model_name,
+            temperature=0.3,
+        )
+
+    def _rebuild_llm(self) -> BaseChatModel:
+        """Recreate the LLM client from current provider/model settings."""
+        return get_llm(
+            provider=self._provider,
+            model_name=self._model_name,
             temperature=0.3,
         )
 
@@ -775,3 +785,4 @@ if __name__ == "__main__":
     print("\n=== Result ===")
     for k, v in result.items():
         print(f"  {k}: {v}")
+
