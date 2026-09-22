@@ -88,7 +88,7 @@ class ProposedActionAPI(BaseModel):
     filters: list[FilterAPI] = Field(default_factory=list)
     group_by: list[str] = Field(default_factory=list)
     having: list[FilterAPI] = Field(default_factory=list)
-    limit: list[int] = Field(default_factory=list)  # note: agent uses list but we keep as list
+    limit: int | None = None
     values: dict[str, Any] | None = None
     reasoning: str
 

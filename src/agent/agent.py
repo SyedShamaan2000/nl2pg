@@ -37,6 +37,7 @@ Iteration 2 changes vs v1:
   - Multi-provider support: Groq and Gemini.
 """
 
+import datetime
 import logging
 import os
 from typing import Any, Literal
@@ -118,6 +119,16 @@ def get_llm(
 # ---------------------------------------------------------------------------
 
 
+def _serialize_value(val):
+    if isinstance(val, datetime.datetime):
+        return val.isoformat()
+    if isinstance(val, datetime.date) and not isinstance(val, datetime.datetime):
+        return val.isoformat()
+    if isinstance(val, datetime.time):
+        return val.isoformat()
+    return val
+
+
 def _quote_literal(val: Any) -> str:
     """Format a Python value as a SQL literal."""
     if val is None:
@@ -194,11 +205,15 @@ def build_sql(action: ProposedAction) -> str:
             having_clause = ""
             if having:
                 having_clause = " HAVING " + " AND ".join(_render_filter(f) for f in having)
-            return (
+            sql = (
                 f"SELECT {select_cols} FROM {from_clause}{where} "
                 f"GROUP BY {group_clause}{having_clause};"
             )
-        return f"SELECT {select_cols} FROM {from_clause}{where};"
+        else:
+            sql = f"SELECT {select_cols} FROM {from_clause}{where};"
+        if action.limit is not None and action.limit > 0:
+            sql = sql.replace(";", f" LIMIT {action.limit};")
+        return sql
     if action.action == "update":
         if not action.values:
             raise ValueError("UPDATE action requires non-None values")
@@ -365,8 +380,9 @@ class Agent:
 
     def _rebuild_llm(self) -> BaseChatModel:
         """Recreate the LLM client from current provider/model settings."""
+        provider = self._provider or os.getenv("LLM_PROVIDER", "groq").lower()
         return get_llm(
-            provider=self._provider,
+            provider=provider,
             model_name=self._model_name,
             temperature=0.3,
         )
@@ -703,7 +719,10 @@ class Agent:
                         return sql, "No rows returned.", None
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
-                    result = [dict(zip(cols, r)) for r in rows]
+                    result = [
+                        {k: _serialize_value(v) for k, v in dict(zip(cols, r)).items()}
+                        for r in rows
+                    ]
                     logger.info(f"SELECT returned {len(result)} row(s)")
                     return sql, None, result
 
@@ -785,4 +804,3 @@ if __name__ == "__main__":
     print("\n=== Result ===")
     for k, v in result.items():
         print(f"  {k}: {v}")
-
